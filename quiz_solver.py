@@ -10,13 +10,19 @@ from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
-from urllib import request
+from urllib import parse, request
 
 QUESTION_URL = "https://raw.githubusercontent.com/FaisalXL/dso429-hourly-quiz/main/questions.csv"
-PRACTICE_KEYS_URL = "https://raw.githubusercontent.com/FaisalXL/dso429-hourly-quiz/main/practice_keys.csv"
 
 
 def fetch_csv(url: str) -> str:
+    parsed = parse.urlparse(url)
+    allowed_paths = {
+        "/FaisalXL/dso429-hourly-quiz/main/questions.csv",
+        "/FaisalXL/dso429-hourly-quiz/main/practice_keys.csv",
+    }
+    if parsed.scheme != "https" or parsed.hostname != "raw.githubusercontent.com" or parsed.path not in allowed_paths:
+        raise ValueError(f"Unsupported quiz URL: {url}")
     with request.urlopen(url, timeout=30) as response:
         return response.read().decode("utf-8")
 
@@ -67,6 +73,8 @@ def parse_option_value(option_text: str) -> Optional[Decimal]:
 
 
 def nearest_option_for_value(options: Iterable[Tuple[str, str]], value: Decimal, *, integer: bool = False) -> str:
+    if integer:
+        value = value.quantize(Decimal("1"), rounding=ROUND_HALF_UP)
     candidates: List[Tuple[Decimal, str]] = []
     for letter, option_text in options:
         parsed = parse_option_value(option_text)
@@ -93,7 +101,10 @@ def solve_question(question_text: str, options: List[Tuple[str, str]]) -> str:
     q_lower = question.lower()
 
     if "compounded annually" in q_lower:
-        principal = parse_money(re.search(r"of\s+\$?([0-9,]+(?:\.\d+)?)", question, re.I).group(1))
+        principal_match = re.search(r"(?:investment|principal)\s+of\s+\$?([0-9,]+(?:\.\d+)?)", question, re.I)
+        if not principal_match:
+            principal_match = re.search(r"\$?([0-9,]+(?:\.\d+)?)\s+grows\s+at", question, re.I)
+        principal = parse_money(principal_match.group(1))
         rate = Decimal(re.search(r"(\d+(?:\.\d+)?)%", question).group(1)) / Decimal("100")
         years = int(re.search(r"after\s+(\d+)\s+years", question, re.I).group(1))
         computed = principal * ((Decimal("1") + rate) ** years)
@@ -132,9 +143,26 @@ def solve_question(question_text: str, options: List[Tuple[str, str]]) -> str:
         return nearest_option_for_value(options, computed, integer=True)
 
     if "drawn at random" in q_lower:
-        values = [Decimal(part) for part in re.findall(r"\d+(?:\.\d+)?", question)]
-        favorable = values[0]
-        total = sum(values)
+        match = re.search(
+            r"holds\s+(\d+)\s+([A-Za-z]+)\s+tickets,\s+(\d+)\s+([A-Za-z]+)\s+tickets\s+and\s+(\d+)\s+([A-Za-z]+)\s+tickets",
+            question,
+            re.I,
+        )
+        if not match:
+            raise ValueError(f"Unable to parse ticket counts from question: {question}")
+        first_count, first_label, second_count, second_label, third_count, third_label = match.groups()
+        labels = [first_label.lower(), second_label.lower(), third_label.lower()]
+        target_label = None
+        for phrase in ["probability it is a", "probability it is an", "probability it is", "ticket is a", "ticket is an"]:
+            target_match = re.search(rf"{phrase}\s+([A-Za-z]+)\s+ticket", question, re.I)
+            if target_match:
+                target_label = target_match.group(1).lower()
+                break
+        if target_label is None or target_label not in labels:
+            raise ValueError(f"Unable to determine target ticket type from question: {question}")
+        counts = [int(first_count), int(second_count), int(third_count)]
+        favorable = Decimal(counts[labels.index(target_label)])
+        total = sum(Decimal(count) for count in counts)
         computed = (favorable / total) * Decimal("100")
         return nearest_option_for_value(options, computed)
 
@@ -169,11 +197,16 @@ def solve_question(question_text: str, options: List[Tuple[str, str]]) -> str:
         return nearest_option_for_value(options, quantize_money(computed))
 
     if "pattern continues" in q_lower or "series runs" in q_lower:
-        numbers = [int(value) for value in re.findall(r"-?\d+", question)]
-        if len(numbers) < 2:
+        pattern = r"(?:runs\s+|series\s+|pattern continues\s+)([-+]?\d+(?:\s*,\s*[-+]?\d+)*)|([-+]?\d+(?:\s*,\s*[-+]?\d+)*)"
+        series_match = re.search(pattern, question, re.I)
+        if not series_match:
             raise ValueError(f"Unable to determine arithmetic progression from question: {question}")
-        diff = numbers[1] - numbers[0]
-        computed = Decimal(numbers[-1] + diff)
+        captured = next(group for group in series_match.groups() if group is not None)
+        seq = [int(value) for value in re.findall(r"-?\d+", captured)]
+        if len(seq) < 2:
+            raise ValueError(f"Unable to determine arithmetic progression from question: {question}")
+        diff = seq[-1] - seq[-2]
+        computed = Decimal(seq[-1] + diff)
         return nearest_option_for_value(options, computed, integer=True)
 
     raise ValueError(f"Unsupported question type: {question}")
@@ -182,8 +215,6 @@ def solve_question(question_text: str, options: List[Tuple[str, str]]) -> str:
 def solve_round(round_id: int, rows: List[Dict[str, str]]) -> Dict[str, str]:
     answers: Dict[str, str] = {}
     for row in rows:
-        if int(row["round_id"]) != round_id:
-            continue
         q_index = int(row["q_index"])
         options = [("A", row["option_a"]), ("B", row["option_b"]), ("C", row["option_c"]), ("D", row["option_d"])]
         letter = solve_question(row["question_text"], options)
@@ -199,14 +230,17 @@ def write_round_file(output_dir: Path, round_id: int, payload: Dict[str, str]) -
 
 
 def build_answers(rows: List[Dict[str, str]], start_round: int, end_round: Optional[int], output_dir: Path) -> List[Path]:
+    rounds_by_id: Dict[int, List[Dict[str, str]]] = {}
+    for row in rows:
+        rounds_by_id.setdefault(int(row["round_id"]), []).append(row)
     if end_round is None:
-        end_round = max(int(row["round_id"]) for row in rows)
+        end_round = max(rounds_by_id)
     written_paths: List[Path] = []
     for round_id in range(start_round, end_round + 1):
-        round_rows = [row for row in rows if int(row["round_id"]) == round_id]
+        round_rows = rounds_by_id.get(round_id, [])
         if not round_rows:
             continue
-        payload = solve_round(round_id, rows)
+        payload = solve_round(round_id, round_rows)
         written_paths.append(write_round_file(output_dir, round_id, payload))
     return written_paths
 
@@ -214,7 +248,6 @@ def build_answers(rows: List[Dict[str, str]], start_round: int, end_round: Optio
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate answer JSON files for the hourly quiz.")
     parser.add_argument("--questions-url", default=QUESTION_URL)
-    parser.add_argument("--practice-keys-url", default=PRACTICE_KEYS_URL)
     parser.add_argument("--start-round", type=int, default=1)
     parser.add_argument("--end-round", type=int, default=None)
     parser.add_argument("--output-dir", default="answers")
